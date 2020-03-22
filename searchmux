@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+#
+# SearchMux -- search engine multiplex server, e.g. for bang syntax
+# Copyright (C) 2020  Johannes Rosenberger
+# 
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -e 
+
+SELF="$0" 
+VERSION="0.42"
+
+# In function 'handle' stdin/stdout are connected to netcat.
+# Therefore, we redirect all output not to be sent over to the client to stderr.
+log() {
+	echo "$@" >&2
+}
+
+
+usage() {
+	arg="\e[4mport\e[0m"
+	var=SEARCHMUX_PORT
+	log "Usage: $SELF -h|--help|-v|--version"
+	log -e "       $SELF [$arg]"
+	log ""
+	log "Relevant env vars:"
+	log "    - $var	:: Natural      # port number"
+	log "    - SEARCHMUX_SEARCH_FUN :: function name # default search engine"
+	log "      function (:: Query -> URL) must be exported!!"
+	log "      default: defaultSearch"
+	log ""
+	log -e "Either $arg or $var must be set."
+	exit "$1"
+}
+
+########################################################################
+# Settings/Cmdline handling
+
+case "$1" in
+	-v | --version ) log "$SELF version $VERSION";;
+	-h | --help ) usage 0;;
+	* ) port="${1:-${SEARCHMUX_PORT:-}}";;
+esac
+
+
+if [ -z "$port" ]; then
+	log error: "listening port undefined"
+	usage 1
+fi
+
+bangSearch() { printf 'https://ddg.gg/lite/?q=!%s' "$1"; }
+defaultSearch() {
+	local query="$1"
+	case "$query" in
+		!!* ) bangSearch "${query:2}";;
+		%21%21* ) bangSearch "${query:6}";;
+		* ) printf 'http://occusearch.de/?q=%s' "$query";;
+	esac
+}
+search() { "${SEARCHMUX_SEARCH_FUN:-defaultSearch}" "$1"; }
+
+export search defaultSearch bangSearch
+
+########################################################################
+
+
+methodError() {
+	cat <<-'EOF'
+	HTTP/1.1 405 Method Not Allowed
+	Allow: GET
+	
+	EOF
+}
+redirect() {
+	local proto query
+	proto="$1"
+	query="$2"
+	cat <<-EOF
+	$proto 303 See Other
+	Location: $(search "$query")
+	
+	EOF
+}
+
+handle() {
+	local request proto method query
+	read -r request
+# shellcheck disable=SC2001
+# SC2001: See if you can use ${variable//search/replace} instead.
+#  -> no, I cannot
+	request="$(echo "$request" | sed 's/\r//g')"
+	sed '/^\r$/q' > /dev/null
+
+	method="${request%% *}"
+	proto="${request##* }"
+
+	if [ "$method" != GET ]; then
+		methodError
+	else
+		query="${request#$method /}"
+		query="${query% $proto}"
+		redirect "$proto" "$query"
+	fi
+}
+
+
+while true; do
+	coproc nc { nc -l "$port" ; }
+	{ handle | sed 's/\n/\r\n/g'; } <&"${nc[0]}" >&"${nc[1]}"
+
+# shellcheck disable=SC2154
+# SC2154: nc_PID is referenced but not assigned.
+#  -> yes, it is assigned by 'coproc'
+	wait "$nc_PID"
+done
+
+# vim: noexpandtab
